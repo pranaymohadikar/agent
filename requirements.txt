@@ -1,0 +1,11 @@
+pandas
+dotenv
+langchain
+langgraph
+grandalf
+langchain-tavily
+langchain-openai
+langchain_community
+langgraph-supervisor
+duckduckgo-search
+streamlit
