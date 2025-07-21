@@ -79,8 +79,8 @@ class QueryRequest(BaseModel):
     question: str
     
     
-llm = ChatOllama(model="llama3.2")
-#llm = ChatOpenAI(model = "gpt-4o-mini")
+#llm = ChatOllama(model="llama3.2")
+llm = ChatOpenAI(model = "gpt-4o-mini")
 schema = get_schema_from_db("fake_db.sqlite", "data")
 
 def route(state: AgentState):
@@ -98,11 +98,31 @@ def route(state: AgentState):
     
     if any(re.search(pattern, question) for pattern in date_keywords):
         return {**state, "next_node":"parse_date", "date_type": "exact"}
-    else: #if no specific date then consider te current month and year
-        today = datetime.now()
-        current_month_year = today.strftime("%Y-%m")
-        return {**state, "parsed_date": current_month_year, "next_node": "generate_sql", "date_type": "month_year" }
+    # else: #if no specific date then consider te current month and year
+    #     today = datetime.now() 
+    #     current_month_year = today.strftime("%Y-%m")
+    #     return {**state, "parsed_date": current_month_year, "next_node": "generate_sql", "date_type": "month_year" }
 
+
+    # Else: get latest year and month from the database
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(Date) FROM data")  # Replace with correct column name if needed
+        latest_date_str = cursor.fetchone()[0]
+        conn.close()
+
+        if latest_date_str:
+            latest_date = datetime.strptime(latest_date_str.split()[0], "%Y-%m-%d")
+            parsed_date = latest_date.strftime("%Y-%m")
+        else:
+            parsed_date = datetime.now().strftime("%Y-%m")  # fallback
+
+    except Exception as e:
+        print(f"Failed to retrieve latest date from DB: {e}")
+        parsed_date = datetime.now().strftime("%Y-%m")
+
+    return {**state, "parsed_date": parsed_date, "next_node": "generate_sql", "date_type": "month_year"}
     
 date_patterns = [
     r"\b(yesterday|today|tomorrow|last|next|week|month|day)\b",                       # natural language
@@ -189,6 +209,8 @@ Instructions:
 - Be case-sensitive with column names (e.g., use `Date` not `date`.
 - If a parsed date is available (e.g., `2025-05-19`), use it in the format `'YYYY-MM-DD'`
 - When writing SQL involving dates (e.g., for grouping, filtering, or comparisons), always extract the date part using DATE(Date).
+- use specific columns whcih are mentioned in the question, if not mentioned then use all columns.
+- Never use `SELECT *`. Instead, select only the relevant columns (e.g., `message`, `location`, etc.).
 
 Here are some examples:
 
@@ -205,10 +227,11 @@ Q: Get message count on 19th may or may 10
 Parsed Date: 2025-05-19 
 SQL: SELECT COUNT(message) FROM data WHERE DATE(Date) = '2025-05-19';
 
-Q: Get positive messages (no specific date). Here the parsed date is current year and month whcih you will get from the datetime.now()
+Q: Get positive messages (no specific date). Here the parsed date is latest year and month whcih you will get from the database
 Parsed Date: 2025-07
-SQL: SELECT * FROM data WHERE LOWER(sentiment) = 'positive' AND strftime('%Y-%m', Date) = '2025-07';
+SQL: SELECT message FROM data WHERE LOWER(sentiment) = 'positive' AND strftime('%Y-%m', Date) = '2025-07';
 
+ 
 
 
 Now answer the following:
@@ -289,7 +312,7 @@ def run_sql(state: AgentState):
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql(sql_query, conn)
-        result = df.to_markdown(index=False) if not df.empty else "no result"
+        result = df.to_string(index=False) if not df.empty else "no result"
     except Exception as e:
         result = f"sql execution error {e}"
     finally:
@@ -339,58 +362,58 @@ builder.add_edge('summarizer', END)
 graph = builder.compile()
 
 
-from IPython.display import display, Image
+# from IPython.display import display, Image
 
-graph_bytes = graph.get_graph().draw_mermaid_png()
-with open("SQL.png", "wb") as f:
-    f.write(graph_bytes)
+# graph_bytes = graph.get_graph().draw_mermaid_png()
+# with open("SQL.png", "wb") as f:
+#     f.write(graph_bytes)
 
-print("Graph saved as 'SQL.png'")
-
-
-input_state = {"question": "count of positive messages"}
-output = graph.invoke(input_state)
-
-print("Generated SQL:\n", output["query"])
+# print("Graph saved as 'SQL.png'")
 
 
-print("\nQuery Result:\n", output["result"]) 
-print("\n Summary: \n ", output['summary'])
+# input_state = {"question": "provide me summary of negative messages"}
+# output = graph.invoke(input_state)
+
+# print("Generated SQL:\n", output["query"])
 
 
-# @app.post("/query")
-# async def process_query(request: QueryRequest):
-#     try:
-#         input_state = {"question": request.question}
-#         output = graph.invoke(input_state)
+# #print("\nQuery Result:\n", output["result"]) 
+# print("\n Summary: \n ", output['summary'])
+
+
+@app.post("/query")
+async def process_query(request: QueryRequest):
+    try:
+        input_state = {"question": request.question}
+        output = graph.invoke(input_state)
         
-#         return {
-#             "question": request.question,
-#             "sql_query": output["query"],
-#             "result": output["result"],
-#             "summary": output['summary']
-#         }
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+        return {
+            "question": request.question,
+            "sql_query": output["query"],
+            "result": output["result"],
+            "summary": output['summary']
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# @app.get("/schema")
-# async def get_schema():
-#     new_schema = get_schema_from_db("fake_db.sqlite", "data")
-#     return {"schema": new_schema}
-
-
+@app.get("/schema")
+async def get_schema():
+    new_schema = get_schema_from_db("fake_db.sqlite", "data")
+    return {"schema": new_schema}
 
 
-# @app.get("/")
-# async def root():
-#     return {
-#         "status": "API is running",
-#         "endpoints": {
-#             "query": "/query",
-#             "schema": "/schema"
-#         },
-#         "documentation": "/docs"
-#     }
 
-# if __name__ == "__main__":
-#     uvicorn.run(app, host="127.0.0.1", port=8000)
+
+@app.get("/")
+async def root():
+    return {
+        "status": "API is running",
+        "endpoints": {
+            "query": "/query",
+            "schema": "/schema"
+        },
+        "documentation": "/docs"
+    }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
