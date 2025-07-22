@@ -26,6 +26,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
+#llm = ChatOllama(model="llama3.2")
+llm = ChatOpenAI(model = "gpt-4o-mini")
 file_path = 'fake_messages_dataset.xlsx'
 db_path = "fake_db"
 table_name = "data"
@@ -66,7 +68,24 @@ def get_schema_from_db(db_path: str, table_name: str) -> str:
     return schema
 
 
+def init_cache_db():
+    "initialize cache database if it doesn't exist"
+    conn = sqlite3.connect('query_cache.db')
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS query_cache (
+                   normalized_sql TEXT PRIMARY KEY,
+                   raw_question TEXT,
+                   sql_query TEXT,
+                   result TEXT,
+                   summary TEXT
+                   );
+""")
+    
+    conn.commit()
+    conn.close()
 
+init_cache_db()
 
 class AgentState(TypedDict):
     question: str
@@ -77,10 +96,76 @@ class AgentState(TypedDict):
     
 class QueryRequest(BaseModel):
     question: str
+
+
+
+#cache utility fuction
+
+# def normalize_query(q: str):
+#     return re.sub(r'\s+', " ", q.strip().lower()) 
+
+def normalize_sql(sql: str) -> str:
+    return re.sub(r'\s+', ' ', sql.strip().lower())
+
+# def get_cached_result(normalized_query: str):
+#     norm_quest = normalize_query(normalized_query)
+#     conn = sqlite3.connect("query_cache.db")
+#     cursor = conn.cursor()
+#     cursor.execute("""select sql_query, result, summary from query_cache where normalized_query = ?;""", (norm_quest,))
+
+#     row = cursor.fetchone()
+#     conn.close()
+
+#     if row:
+#         return{
+#             "query": row[0],
+#             "result": row[1],
+#             "summary": row[2]
+
+#         } 
+#     return None
+
+
+def get_cached_result_by_sql(sql_query: str):
+    norm_sql = normalize_sql(sql_query)
+    conn = sqlite3.connect("query_cache.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT result, summary FROM query_cache
+        WHERE normalized_sql = ?;
+    """, (norm_sql,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {"result": row[0], "summary": row[1]}
+    return None
+
+# def store_cache_result(normalized_query: str, sql_query:str, result: str, summary:str):
+#     norm_quest = normalize_query(normalized_query)
+#     conn = sqlite3.connect("query_cache.db")
+#     cursor = conn.cursor()
+#     cursor.execute("""
+#         INSERT OR REPLACE INTO query_cache (normalized_query, raw_question, sql_query, result, summary)
+#         VALUES (?, ?, ?, ?, ?);
+#     """, (norm_quest, normalized_query, sql_query, result, summary))
     
-    
-#llm = ChatOllama(model="llama3.2")
-llm = ChatOpenAI(model = "gpt-4o-mini")
+#     conn.commit()
+#     conn.close()
+
+
+def store_sql_cache( sql_query: str, question: str, result: str, summary: str):
+    norm_sql = normalize_sql(sql_query)
+    conn = sqlite3.connect("query_cache.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR REPLACE INTO query_cache (normalized_sql, raw_question, sql_query, result, summary)
+        VALUES (?, ?, ?, ?, ?);
+    """, (norm_sql, question, sql_query, result, summary))
+    conn.commit()
+    conn.close()
+
+
+
 schema = get_schema_from_db("fake_db.sqlite", "data")
 
 def route(state: AgentState):
@@ -307,8 +392,8 @@ def run_sql(state: AgentState):
     sql_query = state.get("query", "").strip()
 
     
-    if sql_query.lower().startswith("sql:"):
-        sql_query = sql_query[4:].strip()
+    if sql_query.lower().startswith("```sql:"):
+        sql_query = sql_query[7:].strip()
     try:
         conn = sqlite3.connect(db_path)
         df = pd.read_sql(sql_query, conn)
@@ -380,40 +465,90 @@ graph = builder.compile()
 # #print("\nQuery Result:\n", output["result"]) 
 # print("\n Summary: \n ", output['summary'])
 
+question_text = "get me the count of positive messages"
+# cached = get_cached_result(question_text)
 
-@app.post("/query")
-async def process_query(request: QueryRequest):
-    try:
-        input_state = {"question": request.question}
-        output = graph.invoke(input_state)
-        
-        return {
-            "question": request.question,
-            "sql_query": output["query"],
-            "result": output["result"],
-            "summary": output['summary']
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+# if cached:
+#     print("Using cached result!")
+#     output = {
+#         "query": cached["query"],
+#         "result": cached["result"],
+#         "summary": cached["summary"]
+#     }
+# else:
+#     print("No cache hit. Invoking LangGraph...")
+#     input_state = {"question": question_text}
+#     output = graph.invoke(input_state)
 
-@app.get("/schema")
-async def get_schema():
-    new_schema = get_schema_from_db("fake_db.sqlite", "data")
-    return {"schema": new_schema}
+#     # Store result in cache
+#     store_cache_result(
+#         question_text,
+#         output["query"],
+#         output["result"],
+#         output["summary"]
+#     )
 
+# print("Generated SQL:\n", output["query"])
+# print("\nSummary:\n", output["summary"])
 
+input_state = {"question": question_text}
+intermediate_output = graph.invoke(input_state)
 
+sql_query = intermediate_output["query"]
+cached = get_cached_result_by_sql(sql_query)
 
-@app.get("/")
-async def root():
-    return {
-        "status": "API is running",
-        "endpoints": {
-            "query": "/query",
-            "schema": "/schema"
-        },
-        "documentation": "/docs"
+if cached:
+    print("Using cached result for identical SQL!")
+    output = {
+        "query": sql_query,
+        "result": cached["result"],
+        "summary": cached["summary"]
     }
+else:
+    # Run full flow (SQL execution, summarization)
+    print("No cache hit. Running SQL execution and summarization...")
+    output = graph.invoke(input_state)
+    store_sql_cache(sql_query, question_text, output["result"], output["summary"])
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+
+print("Generated SQL:\n", output["query"])
+print("\nSummary:\n", output["summary"])
+
+
+
+# @app.post("/query")
+# async def process_query(request: QueryRequest):
+#     try:
+#         input_state = {"question": request.question}
+#         output = graph.invoke(input_state)
+        
+#         return {
+#             "question": request.question,
+#             "sql_query": output["query"],
+#             "result": output["result"],
+#             "summary": output['summary']
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+# @app.get("/schema")
+# async def get_schema():
+#     new_schema = get_schema_from_db("fake_db.sqlite", "data")
+#     return {"schema": new_schema}
+
+
+
+
+# @app.get("/")
+# async def root():
+#     return {
+#         "status": "API is running",
+#         "endpoints": {
+#             "query": "/query",
+#             "schema": "/schema"
+#         },
+#         "documentation": "/docs"
+#     }
+
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="127.0.0.1", port=8000)
